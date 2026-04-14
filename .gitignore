@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .vercel/
+*.tsbuildinfo
 __pycache__/
 *.pyc
 .venv/
