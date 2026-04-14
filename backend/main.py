@@ -334,10 +334,10 @@ def _run_claude_cli(system_prompt: str, prompt_text: str) -> Dict[str, Any]:
         MODEL_ID,
         "--system-prompt",
         system_prompt,
+        "--json-schema",
+        json.dumps(ACTION_SCHEMA),
         "--max-budget-usd",
         MAX_BUDGET_USD,
-        "--permission-mode",
-        "bypassPermissions",
         prompt_text,
     ]
 
