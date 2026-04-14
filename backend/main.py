@@ -501,9 +501,14 @@ def create_app() -> FastAPI:
 
         envelope = _extract_json_envelope(cli["result_text"])
         if not envelope or not isinstance(envelope, dict):
+            logger.warning(
+                "envelope parse failed; result_text[:400]=%r",
+                (cli["result_text"] or "")[:400],
+            )
+            fallback_text = (cli["result_text"] or "").strip()
             return ChatResponse(
                 message=(
-                    cli["result_text"].strip()
+                    fallback_text
                     or "I could not parse a structured action plan for that request. "
                     "Try rephrasing."
                 ),
