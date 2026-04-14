@@ -221,22 +221,42 @@ def _build_system_prompt(ledger: Dict[str, Any]) -> str:
     return (
         "You are Ledger Copilot, a finance AI assistant for a small business "
         "bookkeeper. You work inside a GenLedge-style product shell.\n\n"
-        "You MUST reply with a single JSON object matching the schema the "
-        "caller has provided: {assistant_message: string, actions: array}. "
-        "Do not add prose outside the JSON. The server will execute each "
-        "action against the real mock ledger.\n\n"
-        "Available actions (tool field):\n"
-        "  1. categorize_transaction {transaction_id, category, account_code, confidence, reasoning}\n"
-        "  2. reconcile_bank_line    {transaction_id, match_type (invoice|bill|none), match_id, reasoning}\n"
-        "  3. generate_ar_reminder   {invoice_id, subject, body}\n\n"
+        "OUTPUT CONTRACT (CRITICAL):\n"
+        "Your ENTIRE reply MUST be a single JSON object, with no prose, no "
+        "markdown fences, no commentary before or after. The object MUST have "
+        "exactly these two top-level keys:\n"
+        '  - "assistant_message": a short string (one to three sentences) '
+        "summarizing what you did for the user.\n"
+        '  - "actions": an array (possibly empty) of action objects to be '
+        "executed against the ledger.\n\n"
+        "Each action object has the shape:\n"
+        '  {"tool": "<one of: categorize_transaction | reconcile_bank_line | '
+        'generate_ar_reminder>", "args": {...}}\n\n'
+        "Args per tool:\n"
+        "  - categorize_transaction: {transaction_id, category, account_code, "
+        "confidence (0-1 number), reasoning}\n"
+        "  - reconcile_bank_line:    {transaction_id, match_type "
+        "('invoice' | 'bill' | 'none'), match_id, reasoning}\n"
+        "  - generate_ar_reminder:   {invoice_id, subject, body}\n\n"
         "Guidelines:\n"
-        "- When the user asks you to categorize, emit one categorize_transaction action per pending transaction.\n"
-        "- When reconciling, match on amount, customer or vendor name, and date proximity. "
-        "If nothing matches confidently, use match_type='none' with match_id=''.\n"
-        "- When drafting reminders, only target invoices with days_overdue > 0. "
-        "Tone is professional and direct, sign 'Harbor and Oak', no em dashes.\n"
-        "- Keep assistant_message short. Summarize what you did, do not restate every row.\n"
-        "- Never invent transactions, invoices, bills, or customers outside the provided ledger.\n\n"
+        "- When the user asks you to categorize, emit one "
+        "categorize_transaction action per pending transaction.\n"
+        "- When reconciling, match on amount, customer or vendor name, and "
+        "date proximity. If nothing matches confidently, use match_type='none' "
+        "with match_id=''.\n"
+        "- When drafting reminders, only target invoices with "
+        "days_overdue > 0. Tone is professional and direct, sign "
+        "'Harbor and Oak', no em dashes.\n"
+        "- Keep assistant_message short. Summarize what you did, do not "
+        "restate every row.\n"
+        "- Never invent transactions, invoices, bills, or customers outside "
+        "the provided ledger.\n\n"
+        "EXAMPLE of a valid reply:\n"
+        '{"assistant_message":"Categorized TXN-1006 as Software Subscriptions.",'
+        '"actions":[{"tool":"categorize_transaction","args":{'
+        '"transaction_id":"TXN-1006","category":"Software Subscriptions",'
+        '"account_code":"6030","confidence":0.95,'
+        '"reasoning":"Sorted Software monthly SaaS charge."}}]}\n\n'
         "Current ledger snapshot (authoritative):\n"
         f"{ledger_json}\n"
     )
@@ -334,8 +354,6 @@ def _run_claude_cli(system_prompt: str, prompt_text: str) -> Dict[str, Any]:
         MODEL_ID,
         "--system-prompt",
         system_prompt,
-        "--json-schema",
-        json.dumps(ACTION_SCHEMA),
         "--max-budget-usd",
         MAX_BUDGET_USD,
         prompt_text,
@@ -405,9 +423,16 @@ def _run_claude_cli(system_prompt: str, prompt_text: str) -> Dict[str, Any]:
 
 def _extract_json_envelope(text: str) -> Optional[Dict[str, Any]]:
     """Pull the first top-level JSON object out of the LLM's text reply."""
-    text = text.strip()
+    text = (text or "").strip()
     if not text:
         return None
+    # Strip a surrounding markdown code fence if present.
+    if text.startswith("```"):
+        # Drop the first fence line and the trailing ``` if any.
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        if text.endswith("```"):
+            text = text[: -3]
+        text = text.strip()
     # Fast path: pure JSON.
     try:
         return json.loads(text)
