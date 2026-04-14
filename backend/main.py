@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.INFO)
 BACKEND_DIR = Path(__file__).resolve().parent
 LEDGER_FILE = BACKEND_DIR / "mock_ledger.json"
 MODEL_ID = "claude-haiku-4-5-20251001"
-CLI_TIMEOUT_SECONDS = 30
+CLI_TIMEOUT_SECONDS = 90
 MAX_USER_MESSAGE_CHARS = 2000
 MAX_BUDGET_USD = "0.10"
 
