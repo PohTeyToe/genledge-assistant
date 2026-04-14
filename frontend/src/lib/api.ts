@@ -1,15 +1,22 @@
 import type { ChatMessage, ChatResponse, Ledger } from "./types";
 
 const ENV_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "";
+const DEMO_SECRET = (import.meta.env.VITE_DEMO_SECRET as string | undefined) ?? "";
 
 function baseUrl(): string {
   if (ENV_URL) return ENV_URL.replace(/\/$/, "");
   return "http://localhost:8004";
 }
 
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (DEMO_SECRET) headers["x-demo-secret"] = DEMO_SECRET;
+  return headers;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${baseUrl()}${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: { ...authHeaders(), ...(init?.headers ?? {}) },
     ...init,
   });
   if (!res.ok) {

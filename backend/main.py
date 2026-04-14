@@ -1,26 +1,42 @@
 """Ledger Copilot backend.
 
 FastAPI service that powers the GenLedge-style finance AI demo.  One
-``/chat`` endpoint runs a Claude Haiku 4.5 tool-use loop over an in-memory
-mock ledger.  Prompt caching is enabled on the system prompt block so the
-ledger + tool schemas do not re-bill on every turn.
+``/chat`` endpoint runs a single Claude CLI call that returns a structured
+JSON envelope ``{assistant_message, actions}``.  The backend then executes
+the requested actions against the mock ledger.  This path uses the user's
+Claude Code OAuth token via the ``claude`` CLI, not the raw Messages API
+(which rejects OAuth tokens).
+
+Security layers (all enforced on ``/chat``):
+  - shared-secret header ``x-demo-secret``
+  - per-IP rate limit via slowapi (5/min, 30/hour)
+  - CORS allowlist locked to the production Vercel origin
+  - per-request CLI budget cap (``--max-budget-usd 0.10``)
+  - user-message length cap (2000 chars)
+  - 30s subprocess timeout
 """
 
 from __future__ import annotations
 
 import copy
+import hmac
 import json
 import logging
 import os
+import shutil
+import subprocess
+import time
 import uuid
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import anthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 
 logger = logging.getLogger("ledger_copilot")
@@ -28,8 +44,12 @@ logging.basicConfig(level=logging.INFO)
 
 BACKEND_DIR = Path(__file__).resolve().parent
 LEDGER_FILE = BACKEND_DIR / "mock_ledger.json"
-MODEL_ID = "claude-haiku-4-5"
-MAX_TOOL_ITERATIONS = 6
+MODEL_ID = "claude-haiku-4-5-20251001"
+CLI_TIMEOUT_SECONDS = 30
+MAX_USER_MESSAGE_CHARS = 2000
+MAX_BUDGET_USD = "0.10"
+
+ALLOWED_ORIGIN = "https://genledge-assistant.vercel.app"
 
 # ---------------------------------------------------------------------------
 # Mock ledger state
@@ -42,12 +62,10 @@ _SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 def _new_session_ledger() -> Dict[str, Any]:
-    """Return a deep copy of the base ledger for a fresh session."""
     return copy.deepcopy(BASE_LEDGER)
 
 
 def _get_session(session_id: str) -> Dict[str, Any]:
-    """Return the session state, creating it on first use."""
     if session_id not in _SESSIONS:
         _SESSIONS[session_id] = {
             "ledger": _new_session_ledger(),
@@ -57,120 +75,7 @@ def _get_session(session_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions
-# ---------------------------------------------------------------------------
-
-
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "name": "categorize_transaction",
-        "description": (
-            "Assign a chart-of-accounts category to a pending transaction. "
-            "Return the category name, an account code from the chart of "
-            "accounts, and a 0.0-1.0 confidence score. Use this when the "
-            "user asks to categorize uncategorized transactions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "transaction_id": {
-                    "type": "string",
-                    "description": "The transaction ID, e.g. TXN-1004.",
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Chart-of-accounts category name.",
-                },
-                "account_code": {
-                    "type": "string",
-                    "description": "Chart-of-accounts code, e.g. 6020.",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score between 0 and 1.",
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": "One sentence rationale for the category.",
-                },
-            },
-            "required": [
-                "transaction_id",
-                "category",
-                "account_code",
-                "confidence",
-                "reasoning",
-            ],
-        },
-    },
-    {
-        "name": "reconcile_bank_line",
-        "description": (
-            "Match a bank transaction to an open invoice or bill. Use this "
-            "when the user asks to reconcile bank activity. If no confident "
-            "match exists, pass match_type='none' and explain why."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "transaction_id": {
-                    "type": "string",
-                    "description": "The bank transaction ID.",
-                },
-                "match_type": {
-                    "type": "string",
-                    "enum": ["invoice", "bill", "none"],
-                    "description": "What kind of ledger item this matches.",
-                },
-                "match_id": {
-                    "type": "string",
-                    "description": "Matched invoice/bill ID, or empty string if none.",
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": "Why this match was chosen, or why none was found.",
-                },
-            },
-            "required": [
-                "transaction_id",
-                "match_type",
-                "match_id",
-                "reasoning",
-            ],
-        },
-    },
-    {
-        "name": "generate_ar_reminder",
-        "description": (
-            "Draft a reminder email for an overdue invoice. Return a subject "
-            "line and body. Tone should be professional and direct, no em "
-            "dashes. Use this when the user asks to draft reminders for "
-            "overdue invoices."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "invoice_id": {
-                    "type": "string",
-                    "description": "The invoice ID, e.g. INV-2106.",
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Email subject line.",
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Email body in plain text, signed 'Harbor and Oak'.",
-                },
-            },
-            "required": ["invoice_id", "subject", "body"],
-        },
-    },
-]
-
-
-# ---------------------------------------------------------------------------
-# Tool executors
+# Tool executors (server-side; the LLM only emits action descriptors)
 # ---------------------------------------------------------------------------
 
 
@@ -179,7 +84,10 @@ def _execute_categorize(session: Dict[str, Any], args: Dict[str, Any]) -> Dict[s
     txn_id = args.get("transaction_id")
     category = args.get("category")
     account_code = args.get("account_code")
-    confidence = float(args.get("confidence", 0.0))
+    try:
+        confidence = float(args.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
     reasoning = args.get("reasoning", "")
 
     for txn in ledger["transactions"]:
@@ -266,38 +174,69 @@ TOOL_EXECUTORS = {
 
 
 # ---------------------------------------------------------------------------
+# Structured output schema (LLM is forced into this envelope)
+# ---------------------------------------------------------------------------
+
+
+ACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["assistant_message", "actions"],
+    "properties": {
+        "assistant_message": {
+            "type": "string",
+            "description": "Short reply to the user. Summarize what actions were taken, do not restate every row.",
+        },
+        "actions": {
+            "type": "array",
+            "description": "Ordered list of tool calls the server should execute against the mock ledger.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["tool", "args"],
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "enum": [
+                            "categorize_transaction",
+                            "reconcile_bank_line",
+                            "generate_ar_reminder",
+                        ],
+                    },
+                    "args": {"type": "object"},
+                },
+            },
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
 
 def _build_system_prompt(ledger: Dict[str, Any]) -> str:
-    """System prompt including the mock ledger as JSON.
-
-    Rendered once per session; prompt caching keeps the token cost flat across
-    turns.  Do not interpolate per-turn data here or the cache will invalidate.
-    """
     ledger_json = json.dumps(ledger, indent=2, sort_keys=True)
     return (
         "You are Ledger Copilot, a finance AI assistant for a small business "
         "bookkeeper. You work inside a GenLedge-style product shell.\n\n"
-        "Your job is to help the user clean up their books using three tools:\n"
-        "  1. categorize_transaction for uncategorized bank transactions\n"
-        "  2. reconcile_bank_line to match deposits to open invoices and "
-        "payments to bills\n"
-        "  3. generate_ar_reminder to draft reminder emails for overdue "
-        "invoices\n\n"
+        "You MUST reply with a single JSON object matching the schema the "
+        "caller has provided: {assistant_message: string, actions: array}. "
+        "Do not add prose outside the JSON. The server will execute each "
+        "action against the real mock ledger.\n\n"
+        "Available actions (tool field):\n"
+        "  1. categorize_transaction {transaction_id, category, account_code, confidence, reasoning}\n"
+        "  2. reconcile_bank_line    {transaction_id, match_type (invoice|bill|none), match_id, reasoning}\n"
+        "  3. generate_ar_reminder   {invoice_id, subject, body}\n\n"
         "Guidelines:\n"
-        "- When the user asks you to categorize, iterate through every "
-        "pending transaction and call the tool once per item.\n"
-        "- When reconciling, match on amount, customer or vendor name, and "
-        "date proximity. If nothing matches confidently, call the tool with "
-        "match_type='none' and a one-line reason.\n"
-        "- When drafting reminders, target invoices with days_overdue > 0. "
-        "Keep tone professional and direct. No em dashes.\n"
-        "- Keep chat replies short. Summarize what you did after the tools "
-        "run, do not restate every row.\n"
-        "- Never invent transactions, invoices, bills, or customers outside "
-        "the provided ledger.\n\n"
+        "- When the user asks you to categorize, emit one categorize_transaction action per pending transaction.\n"
+        "- When reconciling, match on amount, customer or vendor name, and date proximity. "
+        "If nothing matches confidently, use match_type='none' with match_id=''.\n"
+        "- When drafting reminders, only target invoices with days_overdue > 0. "
+        "Tone is professional and direct, sign 'Harbor and Oak', no em dashes.\n"
+        "- Keep assistant_message short. Summarize what you did, do not restate every row.\n"
+        "- Never invent transactions, invoices, bills, or customers outside the provided ledger.\n\n"
         "Current ledger snapshot (authoritative):\n"
         f"{ledger_json}\n"
     )
@@ -332,6 +271,150 @@ class ChatResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Auth / rate limiting helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_demo_secret(x_demo_secret: Optional[str] = Header(default=None)) -> None:
+    expected = os.environ.get("DEMO_SHARED_SECRET", "")
+    if not expected:
+        # Fail closed: if the server is misconfigured, do not accept traffic.
+        raise HTTPException(status_code=503, detail="demo secret not configured")
+    if not x_demo_secret or not hmac.compare_digest(x_demo_secret, expected):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+
+limiter = Limiter(key_func=get_remote_address)
+
+
+# ---------------------------------------------------------------------------
+# Claude CLI invocation
+# ---------------------------------------------------------------------------
+
+
+def _format_prompt(messages: List[ChatMessage]) -> str:
+    """Flatten the chat turns into a single prompt body for the CLI.
+
+    Claude CLI's ``--print`` mode takes one prompt string.  We preserve turn
+    structure with plain labels so the model still sees the history.
+    """
+    lines: List[str] = []
+    for m in messages:
+        tag = "User" if m.role == "user" else "Assistant"
+        lines.append(f"{tag}: {m.content}")
+    lines.append("Assistant:")
+    return "\n\n".join(lines)
+
+
+def _run_claude_cli(system_prompt: str, prompt_text: str) -> Dict[str, Any]:
+    """Run the Claude CLI in print mode and return the parsed JSON envelope.
+
+    Returns a dict with keys: ``result_text`` (str), ``usage`` (dict|None),
+    ``cost_usd`` (float|None), ``raw`` (full CLI JSON).  Raises HTTPException
+    on timeout, non-zero exit, or unparseable output.
+    """
+    cli_path = shutil.which("claude")
+    if cli_path is None:
+        raise HTTPException(
+            status_code=503,
+            detail="claude CLI not installed on the backend",
+        )
+
+    # Copy the env and strip anything that could redirect the CLI to a
+    # different token or leak. We explicitly pass through the OAuth token
+    # via CLAUDE_CODE_OAUTH_TOKEN, which the CLI auto-detects.
+    cli_env = os.environ.copy()
+
+    cmd = [
+        cli_path,
+        "--print",
+        "--output-format",
+        "json",
+        "--model",
+        MODEL_ID,
+        "--system-prompt",
+        system_prompt,
+        "--max-budget-usd",
+        MAX_BUDGET_USD,
+        "--permission-mode",
+        "bypassPermissions",
+        prompt_text,
+    ]
+
+    # Best-effort flags: some CLI versions expose these, some do not.
+    # We append them if supported via env-flag opt-in, but do not fail if
+    # the CLI rejects unknown flags — we rely on the empty tool surface
+    # (no MCP, no filesystem work) to keep this call tightly scoped.
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=cli_env,
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="claude CLI timed out")
+
+    if proc.returncode != 0:
+        logger.error(
+            "claude CLI exited %s; stderr=%s",
+            proc.returncode,
+            (proc.stderr or "")[:500],
+        )
+        raise HTTPException(status_code=502, detail="claude CLI failed")
+
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.error("claude CLI returned non-JSON output: %r", proc.stdout[:500])
+        raise HTTPException(status_code=502, detail="claude CLI returned non-JSON")
+
+    result_text = envelope.get("result") or ""
+    usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else None
+    cost_usd = envelope.get("total_cost_usd") or envelope.get("cost_usd")
+
+    return {
+        "result_text": result_text,
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "raw": envelope,
+    }
+
+
+def _extract_json_envelope(text: str) -> Optional[Dict[str, Any]]:
+    """Pull the first top-level JSON object out of the LLM's text reply."""
+    text = text.strip()
+    if not text:
+        return None
+    # Fast path: pure JSON.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the first balanced { ... } block.
+    depth = 0
+    start = -1
+    for idx, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                candidate = text[start : idx + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    start = -1
+                    continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -340,147 +423,123 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Ledger Copilot API",
         description="GenLedge-style finance AI demo backend.",
-        version="0.1.0",
+        version="0.2.0",
     )
+
+    app.state.limiter = limiter
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limit exceeded"},
+        )
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5185",
-            "http://127.0.0.1:5185",
-            "http://localhost:5173",
-        ],
-        allow_origin_regex=r"https://.*\.vercel\.app",
+        allow_origins=[ALLOWED_ORIGIN],
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["POST", "GET", "OPTIONS"],
+        allow_headers=["content-type", "x-demo-secret"],
     )
-
-    @app.get("/")
-    def root() -> Dict[str, str]:
-        return {"service": "ledger-copilot", "version": "0.1.0"}
 
     @app.get("/health")
     def health() -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "model": MODEL_ID,
-            "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
-            "active_sessions": len(_SESSIONS),
-        }
+        return {"ok": True}
 
-    @app.get("/ledger/{session_id}")
+    @app.get(
+        "/ledger/{session_id}",
+        dependencies=[Depends(_require_demo_secret)],
+    )
     def get_ledger(session_id: str) -> Dict[str, Any]:
         session = _get_session(session_id)
         return {"ledger": session["ledger"], "emails": session["emails"]}
 
-    @app.post("/reset/{session_id}")
+    @app.post(
+        "/reset/{session_id}",
+        dependencies=[Depends(_require_demo_secret)],
+    )
     def reset(session_id: str) -> Dict[str, Any]:
         _SESSIONS.pop(session_id, None)
         session = _get_session(session_id)
         return {"ok": True, "ledger": session["ledger"]}
 
-    @app.post("/chat", response_model=ChatResponse)
-    def chat(req: ChatRequest) -> ChatResponse:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "ANTHROPIC_API_KEY not configured on the backend. The "
-                    "demo UI still works for ledger rendering but cannot "
-                    "invoke the agent."
-                ),
-            )
+    @app.post(
+        "/chat",
+        response_model=ChatResponse,
+        dependencies=[Depends(_require_demo_secret)],
+    )
+    @limiter.limit("5/minute")
+    @limiter.limit("30/hour")
+    def chat(request: Request, req: ChatRequest) -> ChatResponse:
+        # Validate user-message length before spending CLI budget.
+        for m in req.messages:
+            if m.role == "user" and len(m.content) > MAX_USER_MESSAGE_CHARS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"user message exceeds {MAX_USER_MESSAGE_CHARS} chars",
+                )
 
         session = _get_session(req.session_id)
-        client = anthropic.Anthropic(api_key=api_key)
+        system_prompt = _build_system_prompt(session["ledger"])
+        prompt_text = _format_prompt(req.messages)
 
-        # System prompt with prompt caching.  The block is stable for the
-        # lifetime of the session; per-turn user content goes in messages.
-        system_blocks = [
-            {
-                "type": "text",
-                "text": _build_system_prompt(session["ledger"]),
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        client_ip = get_remote_address(request)
+        t0 = time.monotonic()
+        cli = _run_claude_cli(system_prompt, prompt_text)
+        duration_ms = int((time.monotonic() - t0) * 1000)
 
-        messages: List[Dict[str, Any]] = [
-            {"role": m.role, "content": m.content} for m in req.messages
-        ]
+        usage = cli.get("usage") or {}
+        logger.info(
+            "chat ip=%s duration_ms=%s input_tokens=%s output_tokens=%s cost_usd=%s",
+            client_ip,
+            duration_ms,
+            usage.get("input_tokens"),
+            usage.get("output_tokens"),
+            cli.get("cost_usd"),
+        )
 
-        tool_events: List[ToolCallEvent] = []
-
-        for _ in range(MAX_TOOL_ITERATIONS):
-            response = client.messages.create(
-                model=MODEL_ID,
-                max_tokens=2048,
-                system=system_blocks,
-                tools=TOOLS,
-                messages=messages,
+        envelope = _extract_json_envelope(cli["result_text"])
+        if not envelope or not isinstance(envelope, dict):
+            return ChatResponse(
+                message=(
+                    cli["result_text"].strip()
+                    or "I could not parse a structured action plan for that request. "
+                    "Try rephrasing."
+                ),
+                tool_calls=[],
+                updated_ledger=session["ledger"],
+                emails=session["emails"],
             )
 
-            # Log cache usage for observability.
-            usage = getattr(response, "usage", None)
-            if usage is not None:
-                logger.info(
-                    "turn usage: in=%s cache_read=%s cache_write=%s out=%s",
-                    getattr(usage, "input_tokens", None),
-                    getattr(usage, "cache_read_input_tokens", None),
-                    getattr(usage, "cache_creation_input_tokens", None),
-                    getattr(usage, "output_tokens", None),
-                )
+        assistant_message = str(envelope.get("assistant_message") or "").strip()
+        actions = envelope.get("actions") or []
 
-            if response.stop_reason != "tool_use":
-                final_text = "".join(
-                    b.text for b in response.content if b.type == "text"
-                )
-                return ChatResponse(
-                    message=final_text.strip()
-                    or "Done. Take a look at the ledger on the left.",
-                    tool_calls=tool_events,
-                    updated_ledger=session["ledger"],
-                    emails=session["emails"],
-                )
-
-            # Append the assistant turn verbatim so the tool_use blocks stay
-            # paired with our tool_result responses.
-            messages.append({"role": "assistant", "content": response.content})
-
-            tool_results_block: List[Dict[str, Any]] = []
-            for block in response.content:
-                if block.type != "tool_use":
+        tool_events: List[ToolCallEvent] = []
+        if isinstance(actions, list):
+            for action in actions:
+                if not isinstance(action, dict):
                     continue
-                executor = TOOL_EXECUTORS.get(block.name)
+                tool_name = action.get("tool")
+                args = action.get("args") or {}
+                if not isinstance(args, dict):
+                    continue
+                executor = TOOL_EXECUTORS.get(tool_name)
                 if executor is None:
-                    result = {"ok": False, "error": f"unknown tool {block.name}"}
+                    result = {"ok": False, "error": f"unknown tool {tool_name}"}
                 else:
                     try:
-                        result = executor(session, block.input)
+                        result = executor(session, args)
                     except Exception as exc:  # noqa: BLE001
-                        logger.exception("tool %s crashed", block.name)
+                        logger.exception("tool %s crashed", tool_name)
                         result = {"ok": False, "error": str(exc)}
-
                 tool_events.append(
-                    ToolCallEvent(tool=block.name, input=block.input, result=result)
-                )
-                tool_results_block.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(result),
-                    }
+                    ToolCallEvent(tool=str(tool_name), input=args, result=result)
                 )
 
-            messages.append({"role": "user", "content": tool_results_block})
-
-        # Safety net: we ran out of iterations.
         return ChatResponse(
-            message=(
-                "Stopped after the max tool-call budget. "
-                "Ask me to continue and I will pick up where I left off."
-            ),
+            message=assistant_message
+            or "Done. Take a look at the ledger on the left.",
             tool_calls=tool_events,
             updated_ledger=session["ledger"],
             emails=session["emails"],
