@@ -375,6 +375,26 @@ def _run_claude_cli(system_prompt: str, prompt_text: str) -> Dict[str, Any]:
     usage = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else None
     cost_usd = envelope.get("total_cost_usd") or envelope.get("cost_usd")
 
+    if not result_text:
+        # Log the envelope keys (NOT values) so we can see where the output
+        # actually landed when --json-schema is active.  Never log the full
+        # payload in case it contains internal prompt text.
+        logger.warning(
+            "claude CLI returned empty 'result'; envelope keys=%s",
+            sorted(envelope.keys()),
+        )
+        # Fallbacks commonly seen across CLI versions.
+        for alt in ("structured_output", "content", "text", "output"):
+            val = envelope.get(alt)
+            if isinstance(val, str) and val.strip():
+                result_text = val
+                break
+            if isinstance(val, dict):
+                # structured object: serialize back to JSON so downstream
+                # JSON parser grabs it.
+                result_text = json.dumps(val)
+                break
+
     return {
         "result_text": result_text,
         "usage": usage,
